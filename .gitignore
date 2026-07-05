@@ -1,0 +1,26 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- uv ---
+.venv/
+# uv.lock は追跡する（依存の再現性のためコミットする）
+
+# --- SQLite（ローカルの内部DB） ---
+*.db
+*.sqlite3
+
+# --- secrets ---
+.env
+*.env
+!.env.example
+
+# --- Claude Code（ユーザーローカル設定） ---
+.claude/settings.local.json
+
+# --- macOS ---
+.DS_Store

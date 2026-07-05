@@ -1,0 +1,27 @@
+[project]
+name = "npb-ticket-scraper"
+version = "0.1.0"
+description = "NPBチケット販売スケジュールを球団別アダプターで収集するスクレイパー"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "beautifulsoup4>=4.12",
+    "pdfplumber>=0.11",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/npb_ticket_scraper"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
