@@ -54,9 +54,14 @@ class ScheduleRepository(ABC):
         - 既存で内容不変 → ``last_seen_at`` のみ更新 / status 不変 / ``UNCHANGED``
         - 今回 ``team`` の取得集合に無い既存 → ``ARCHIVED`` / ``REMOVED``
 
+        fingerprint 非対象の項目（``sale_label`` / ``notes`` / ``source_url``）は同一性・
+        通知内容に影響しないため、``UNCHANGED`` 時には再保存しない（``CHANGED`` 時にまとめて
+        更新される）。
+
         Args:
             team: 今回スクレイプした販売主体。``ARCHIVED`` 判定はこの team の範囲で行う。
-            schedules: 取得したスケジュール（すべて ``selling_team == team`` を前提とする）。
+            schedules: 取得したスケジュール。#2 時点の契約として、すべて ``selling_team == team``
+                であることを要求し、満たさない場合は ``ValueError`` を送出する。
             now: 観測時刻。テスト決定性のため注入する（呼び出し側は通常 ``datetime.now(UTC)``）。
 
         Returns:

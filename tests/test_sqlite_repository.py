@@ -154,3 +154,47 @@ def test_bundle_multiple_games_roundtrip(repo: SqliteRepository) -> None:
     # 同一試合を共有する重複行が生じない（多対多の get-or-create）
     game_count = repo._conn.execute("SELECT COUNT(*) c FROM game").fetchone()
     assert game_count["c"] == 3
+
+
+def test_archived_reappearance_returns_to_needs_review(repo: SqliteRepository) -> None:
+    repo.upsert_scraped(TeamId.HANSHIN, [_schedule()], now=_now(1))
+    schedule_id = repo.list_schedules()[0].schedule_id
+    repo.mark_confirmed(schedule_id, now=_now(2))
+    repo.upsert_scraped(TeamId.HANSHIN, [], now=_now(3))  # 消失 → ARCHIVED
+    assert repo.list_schedules()[0].status == ScheduleStatus.ARCHIVED
+
+    # 同一内容で再出現しても、黙って通知対象へ戻さず要確認に落とす
+    results = repo.upsert_scraped(TeamId.HANSHIN, [_schedule()], now=_now(4))
+
+    assert [r.change_kind for r in results] == [ChangeKind.CHANGED]
+    stored = repo.list_schedules()[0]
+    assert stored.status == ScheduleStatus.NEEDS_REVIEW
+    assert repo.list_notifiable() == []
+    last_revision = repo._conn.execute(
+        "SELECT diff_json FROM sale_schedule_revision ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert "_resurrected" in last_revision["diff_json"]
+
+
+def test_games_only_change_is_recorded_in_diff(repo: SqliteRepository) -> None:
+    repo.upsert_scraped(TeamId.HANSHIN, [_schedule(games=[_game(day=10)])], now=_now(1))
+
+    # 発売条件は同一だが対象試合（バンドル）が変わったケース
+    changed = _schedule(games=[_game(day=10), _game(day=11)])
+    results = repo.upsert_scraped(TeamId.HANSHIN, [changed], now=_now(2))
+
+    assert [r.change_kind for r in results] == [ChangeKind.CHANGED]
+    assert len(repo.list_schedules()[0].schedule.games) == 2
+    last_revision = repo._conn.execute(
+        "SELECT diff_json FROM sale_schedule_revision ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert "games" in last_revision["diff_json"]  # 空 diff にならず試合変化を残す
+
+
+def test_selling_team_mismatch_raises(repo: SqliteRepository) -> None:
+    # #2 契約: selling_team は対象 team と一致していなければならない
+    mismatched = _schedule()
+    mismatched.selling_team = TeamId.GIANTS
+
+    with pytest.raises(ValueError, match="selling_team"):
+        repo.upsert_scraped(TeamId.HANSHIN, [mismatched], now=_now())

@@ -10,6 +10,11 @@ __pycache__/
 .venv/
 # uv.lock は追跡する（依存の再現性のためコミットする）
 
+# --- build 成果物 ---
+dist/
+build/
+*.whl
+
 # --- SQLite（ローカルの内部DB） ---
 *.db
 *.sqlite3

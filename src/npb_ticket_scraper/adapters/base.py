@@ -28,7 +28,8 @@ class TeamAdapter(ABC):
         そのまま再配布しない設計原則（docs/decisions.md §1）に従うこと。
 
         Returns:
-            取得した ``SaleSchedule`` のリスト。返す各要素の ``selling_team`` は原則
-            ``self.team_id`` と一致する（ビジター応援席など販売主体が異なる場合を除く）。
+            取得した ``SaleSchedule`` のリスト。#2 時点の契約として、各要素の ``selling_team``
+            は ``self.team_id`` と一致させる（``Repository.upsert_scraped`` がこの前提を検証する）。
+            ビジター応援席など販売主体が異なるケースの取り扱いは #3 で確定する。
         """
         raise NotImplementedError

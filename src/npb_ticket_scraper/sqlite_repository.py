@@ -66,21 +66,30 @@ class SqliteRepository(ScheduleRepository):
         *,
         now: datetime,
     ) -> list[UpsertResult]:
+        # #2 時点の契約: 1回のスクレイプ結果はすべて同一の販売主体（= team）である。
+        # ビジター応援席など selling_team != team の取り扱いは #3 で確定する。契約を明示し、
+        # 突合キー(selling_team, source_key)と archive スコープの一貫性を保証する。
+        for schedule in schedules:
+            if schedule.selling_team != team:
+                raise ValueError(
+                    f"selling_team ({schedule.selling_team.value}) が対象 team ({team.value}) と "
+                    "一致しません。複数販売主体（ビジター応援席など）は #3 で対応予定です。"
+                )
+
         results: list[UpsertResult] = []
         seen_keys: set[str] = set()
 
         for schedule in schedules:
             seen_keys.add(schedule.source_key)
-            game_ids = [self._get_or_create_game(g) for g in schedule.games]
             fingerprint = schedule.content_fingerprint()
             existing = self._conn.execute(
                 "SELECT * FROM sale_schedule WHERE selling_team = ? AND source_key = ?",
-                (team.value, schedule.source_key),
+                (schedule.selling_team.value, schedule.source_key),
             ).fetchone()
 
             if existing is None:
                 schedule_id = self._insert_schedule(schedule, fingerprint, now)
-                self._link_games(schedule_id, game_ids)
+                self._link_games(schedule_id, self._resolve_game_ids(schedule))
                 self._record_revision(schedule_id, None, fingerprint, {"_created": True}, now)
                 results.append(UpsertResult(schedule.source_key, ChangeKind.NEW, schedule_id))
                 continue
@@ -91,6 +100,7 @@ class SqliteRepository(ScheduleRepository):
                 and existing["status"] != ScheduleStatus.ARCHIVED.value
             )
             if unchanged:
+                # 内容不変なら試合の再解決も行わず、観測時刻のみ更新する。
                 self._conn.execute(
                     "UPDATE sale_schedule SET last_seen_at = ? WHERE id = ?",
                     (_dt(now), schedule_id),
@@ -102,7 +112,7 @@ class SqliteRepository(ScheduleRepository):
             if existing["status"] == ScheduleStatus.ARCHIVED.value:
                 diff["_resurrected"] = True
             self._update_schedule(schedule_id, schedule, fingerprint, now)
-            self._link_games(schedule_id, game_ids)
+            self._link_games(schedule_id, self._resolve_game_ids(schedule))
             self._record_revision(schedule_id, existing["content_hash"], fingerprint, diff, now)
             results.append(UpsertResult(schedule.source_key, ChangeKind.CHANGED, schedule_id))
 
@@ -110,12 +120,20 @@ class SqliteRepository(ScheduleRepository):
         self._conn.commit()
         return results
 
+    def _resolve_game_ids(self, schedule: SaleSchedule) -> list[int]:
+        return [self._get_or_create_game(g) for g in schedule.games]
+
     def _get_or_create_game(self, game: Game) -> int:
+        # 自然キーが既存でも、可変項目（開始時刻の確定・会場変更など）を取り込むため UPSERT する。
         self._conn.execute(
             """
-            INSERT OR IGNORE INTO game
+            INSERT INTO game
                 (game_date, home_team, away_team, start_time, venue, season_type)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (game_date, home_team, away_team) DO UPDATE SET
+                start_time = excluded.start_time,
+                venue = excluded.venue,
+                season_type = excluded.season_type
             """,
             (
                 game.game_date.isoformat(),
@@ -159,7 +177,9 @@ class SqliteRepository(ScheduleRepository):
                 _dt(now),
             ),
         )
-        return cursor.lastrowid
+        schedule_id = cursor.lastrowid
+        assert schedule_id is not None  # INSERT 直後は必ず採番される
+        return schedule_id
 
     def _update_schedule(
         self, schedule_id: int, schedule: SaleSchedule, fingerprint: str, now: datetime
@@ -215,21 +235,47 @@ class SqliteRepository(ScheduleRepository):
         )
 
     def _compute_diff(self, existing: sqlite3.Row, schedule: SaleSchedule) -> dict:
-        """既存行と新規スケジュールの、fingerprint 対象フィールドの差分を返す。"""
+        """既存行と新規スケジュールの、fingerprint 対象（スカラ項目 + 対象試合集合）の差分を返す。
+
+        content_fingerprint と同じ観点を対象にする。membership_rank は fingerprint 同様
+        None と "" を同一視して比較する（正規化ポリシーを一致させる）。
+        """
         new_values = {
             "sale_type": schedule.sale_type.value,
-            "membership_rank": schedule.membership_rank,
+            "membership_rank": schedule.membership_rank or "",
             "sale_start": _dt(schedule.sale_start),
             "sale_end": _dt(schedule.sale_end),
             "official_url": schedule.official_url,
         }
+        old_values = {
+            "sale_type": existing["sale_type"],
+            "membership_rank": existing["membership_rank"] or "",
+            "sale_start": existing["sale_start"],
+            "sale_end": existing["sale_end"],
+            "official_url": existing["official_url"],
+        }
         diff: dict = {}
         for field_name in _FINGERPRINT_FIELDS:
-            old = existing[field_name]
-            new = new_values[field_name]
-            if old != new:
-                diff[field_name] = [old, new]
+            if old_values[field_name] != new_values[field_name]:
+                diff[field_name] = [old_values[field_name], new_values[field_name]]
+
+        # 対象試合集合（バンドル）も fingerprint に含まれるため、変化を履歴に残す。
+        old_games = sorted(self._load_game_keys(existing["id"]))
+        new_games = sorted(g.natural_key for g in schedule.games)
+        if old_games != new_games:
+            diff["games"] = [old_games, new_games]
         return diff
+
+    def _load_game_keys(self, schedule_id: int) -> set[str]:
+        rows = self._conn.execute(
+            """
+            SELECT g.game_date, g.home_team, g.away_team FROM game g
+            JOIN sale_schedule_game sg ON sg.game_id = g.id
+            WHERE sg.schedule_id = ?
+            """,
+            (schedule_id,),
+        ).fetchall()
+        return {f"{r['game_date']}|{r['home_team']}|{r['away_team']}" for r in rows}
 
     def _archive_missing(
         self, team: TeamId, seen_keys: set[str], now: datetime
@@ -253,9 +299,15 @@ class SqliteRepository(ScheduleRepository):
         return results
 
     def mark_confirmed(self, schedule_id: int, *, now: datetime) -> None:
+        # ARCHIVED（取得元から消失）を確認済みに昇格させない。消えたものを通知対象へ戻さない。
         self._conn.execute(
-            "UPDATE sale_schedule SET status = ?, last_changed_at = ? WHERE id = ?",
-            (ScheduleStatus.CONFIRMED.value, _dt(now), schedule_id),
+            "UPDATE sale_schedule SET status = ?, last_changed_at = ? WHERE id = ? AND status != ?",
+            (
+                ScheduleStatus.CONFIRMED.value,
+                _dt(now),
+                schedule_id,
+                ScheduleStatus.ARCHIVED.value,
+            ),
         )
         self._conn.commit()
 
