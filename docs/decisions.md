@@ -60,7 +60,42 @@ robots.txt を尊重し、低頻度・適切な間隔でアクセスする。
 いずれの球団も**発売スケジュールの閲覧にログインは不要**。各サイトの利用規約原文の目視確認は残課題
 （調査は要約経由のため、自動アクセス禁止条項の有無を最終確認しきれていない）。
 
-## 7. 積み残し（未調査）
+## 7. データモデルと永続層
+
+発売スケジュールを収集・保存し差分検知するための構造。方針は **純粋ドメイン(dataclasses) +
+Repository 抽象境界 + SQLite 実装**。ドメイン層と差分検知ロジックは DB 非依存の恒久資産とし、
+クラウド DB へ移行する際は Repository 実装（`SqliteRepository`）を差し替えるだけで済むようにする。
+
+### ドメイン（`models.py`）
+
+- `Game`（試合の事実、frozen）: 自然キー = `(game_date, home_team, away_team)`。NPB は実質
+  ダブルヘッダ無しのためこの3項目で一意。
+- `SaleSchedule`（アダプタが返す発売の事実）: `selling_team`（販売主体＝ビジター応援席の販売元
+  差異を吸収）, `sale_type`(正規化区分) + `sale_label`(原文), `membership_rank`(会員ランク原文・
+  **正規化しない**), `sale_start`/`sale_end`, `games`(**多対多**＝1発売が複数試合をバンドル), 
+  `official_url`(誘導先), `source_key`(**アダプタ定義の安定キー**・可変項目を含めない)。
+- 同一性判定は `source_key`、内容変化の検知は `content_fingerprint()`（sale_start/sale_end/
+  sale_type/membership_rank/official_url + 対象試合の自然キー集合のハッシュ）。
+- Enum: `TeamId`(12球団スラッグ) / `SeasonType` / `SaleType` / `ScheduleStatus`。
+
+### 差分検知（`ScheduleRepository.upsert_scraped`）
+
+`source_key` で突合し fingerprint 比較で判定する（§4 の「要確認」ステータスの具体化）:
+
+- 新規 → 追加・`NEEDS_REVIEW`・`NEW`
+- 内容変化 → 更新・`NEEDS_REVIEW` に戻す・`CHANGED`・revision 記録
+- 内容不変 → `last_seen_at` のみ更新・`UNCHANGED`
+- 取得集合から消失 → `ARCHIVED`・`REMOVED`
+
+**通知対象は `CONFIRMED` のみ**（`list_notifiable()`）。誤通知防止の要。時刻は `now` を引数注入し
+テストの決定性を担保する。
+
+### SQLite スキーマ（`schema.sql`）
+
+`game` / `sale_schedule`(UNIQUE(selling_team, source_key)) / `sale_schedule_game`(多対多) /
+`sale_schedule_revision`(変更履歴 diff_json)。日時は ISO 文字列(TEXT)で保存。`.db` は gitignore 済み。
+
+## 8. 積み残し（未調査）
 
 - 交流戦のパ・リーグ6球団のサイト調査
 - 阪神アウェイ戦の「ビジター応援席」の販売主体の特定（相手球団側販売の可能性が高い）
