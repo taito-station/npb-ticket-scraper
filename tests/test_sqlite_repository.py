@@ -200,6 +200,17 @@ def test_selling_team_mismatch_raises(repo: SqliteRepository) -> None:
         repo.upsert_scraped(TeamId.HANSHIN, [mismatched], now=_now())
 
 
+def test_content_fingerprint_is_set_based_on_games() -> None:
+    # 対象試合は集合として扱う: 重複や順序で fingerprint が変わらない（storage の複合キーと整合）
+    g10, g11 = _game(day=10), _game(day=11)
+    base = _schedule(games=[g10, g11])
+    reordered = _schedule(games=[g11, g10])
+    with_dup = _schedule(games=[g10, g11, g10])
+
+    assert base.content_fingerprint() == reordered.content_fingerprint()
+    assert base.content_fingerprint() == with_dup.content_fingerprint()
+
+
 def test_duplicate_source_key_in_batch_raises(repo: SqliteRepository) -> None:
     # 同一 batch 内の source_key 重複はアダプタのバグとして弾く
     dup = [_schedule(source_key="dup"), _schedule(source_key="dup")]

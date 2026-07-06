@@ -2,6 +2,9 @@
 
 ローカル検証・将来の Azure Functions（Consumption）実行での状態保持を担う。ORM は使わず、
 日時は ISO 文字列で保存する。クラウド DB へ移行する際は本クラスを別実装に差し替える。
+
+注: ``sqlite3.connect`` は既定 ``check_same_thread=True`` のため、本インスタンスは単一スレッド
+から使う前提。クラウド配線時（ワーカースレッド跨ぎ）は invocation 毎に接続を作るか別実装へ切替える。
 """
 
 from __future__ import annotations

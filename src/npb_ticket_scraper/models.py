@@ -116,9 +116,10 @@ class SaleSchedule:
         ``source_key`` で同一と判定したスケジュール同士の「中身が変わったか」を比較する。
         対象は通知・誘導に影響する項目（発売日時・区分・会員ランク・誘導先URL・対象試合集合）。
         取得元URL(``source_url``)やラベル文言は同一性の本質でないため含めない。試合集合は
-        自然キーでソートして順序非依存にする。
+        自然キーの集合（重複排除・ソート）で扱い、順序・重複に依存しない。永続層が
+        ``sale_schedule_game`` の複合キーで集合として保持するのと意味を揃える。
         """
-        game_keys = sorted(g.natural_key for g in self.games)
+        game_keys = sorted({g.natural_key for g in self.games})
         parts = [
             self.sale_type.value,
             self.membership_rank or "",
