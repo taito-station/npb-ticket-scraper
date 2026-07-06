@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sale_schedule (
     status          TEXT NOT NULL,      -- ScheduleStatus.value
     first_seen_at   TEXT NOT NULL,      -- 初回観測時刻（ISO datetime）
     last_seen_at    TEXT NOT NULL,      -- 最終観測時刻
-    last_changed_at TEXT NOT NULL,      -- 最終内容変化時刻
+    last_changed_at TEXT NOT NULL,      -- 最終の内容または状態(status)変化時刻
     UNIQUE (selling_team, source_key)
 );
 

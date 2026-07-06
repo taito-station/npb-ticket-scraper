@@ -66,58 +66,69 @@ class SqliteRepository(ScheduleRepository):
         *,
         now: datetime,
     ) -> list[UpsertResult]:
-        # #2 時点の契約: 1回のスクレイプ結果はすべて同一の販売主体（= team）である。
-        # ビジター応援席など selling_team != team の取り扱いは #3 で確定する。契約を明示し、
-        # 突合キー(selling_team, source_key)と archive スコープの一貫性を保証する。
+        # #2 時点の契約を事前検証する（部分書き込みを避けるため、書き込み前にまとめて弾く）:
+        #  1. すべて同一の販売主体（= team）。selling_team != team の扱いは #3 で確定。
+        #  2. batch 内で source_key は一意。重複はアダプタ側のバグなので静かに飲み込まない。
+        # なお schedules が空のとき当該 team の既存は全て ARCHIVED 化されるため、取得失敗時
+        # （サイト障害・パース失敗）に空リストで呼ばないことは呼び出し側の責務とする。
+        seen_keys: set[str] = set()
         for schedule in schedules:
             if schedule.selling_team != team:
                 raise ValueError(
                     f"selling_team ({schedule.selling_team.value}) が対象 team ({team.value}) と "
                     "一致しません。複数販売主体（ビジター応援席など）は #3 で対応予定です。"
                 )
+            if schedule.source_key in seen_keys:
+                raise ValueError(f"source_key が batch 内で重複しています: {schedule.source_key}")
+            seen_keys.add(schedule.source_key)
 
         results: list[UpsertResult] = []
-        seen_keys: set[str] = set()
+        try:
+            for schedule in schedules:
+                fingerprint = schedule.content_fingerprint()
+                existing = self._conn.execute(
+                    "SELECT * FROM sale_schedule WHERE selling_team = ? AND source_key = ?",
+                    (schedule.selling_team.value, schedule.source_key),
+                ).fetchone()
 
-        for schedule in schedules:
-            seen_keys.add(schedule.source_key)
-            fingerprint = schedule.content_fingerprint()
-            existing = self._conn.execute(
-                "SELECT * FROM sale_schedule WHERE selling_team = ? AND source_key = ?",
-                (schedule.selling_team.value, schedule.source_key),
-            ).fetchone()
+                if existing is None:
+                    schedule_id = self._insert_schedule(schedule, fingerprint, now)
+                    self._link_games(schedule_id, self._resolve_game_ids(schedule))
+                    self._record_revision(schedule_id, None, fingerprint, {"_created": True}, now)
+                    results.append(UpsertResult(schedule.source_key, ChangeKind.NEW, schedule_id))
+                    continue
 
-            if existing is None:
-                schedule_id = self._insert_schedule(schedule, fingerprint, now)
-                self._link_games(schedule_id, self._resolve_game_ids(schedule))
-                self._record_revision(schedule_id, None, fingerprint, {"_created": True}, now)
-                results.append(UpsertResult(schedule.source_key, ChangeKind.NEW, schedule_id))
-                continue
-
-            schedule_id = existing["id"]
-            unchanged = (
-                existing["content_hash"] == fingerprint
-                and existing["status"] != ScheduleStatus.ARCHIVED.value
-            )
-            if unchanged:
-                # 内容不変なら試合の再解決も行わず、観測時刻のみ更新する。
-                self._conn.execute(
-                    "UPDATE sale_schedule SET last_seen_at = ? WHERE id = ?",
-                    (_dt(now), schedule_id),
+                schedule_id = existing["id"]
+                unchanged = (
+                    existing["content_hash"] == fingerprint
+                    and existing["status"] != ScheduleStatus.ARCHIVED.value
                 )
-                results.append(UpsertResult(schedule.source_key, ChangeKind.UNCHANGED, schedule_id))
-                continue
+                if unchanged:
+                    # 内容不変なら試合の再解決も行わず、観測時刻のみ更新する。fingerprint 非対象の
+                    # 試合単独更新（会場・開始時刻のみの変化）はこの経路では取りこぼす（許容）。
+                    self._conn.execute(
+                        "UPDATE sale_schedule SET last_seen_at = ? WHERE id = ?",
+                        (_dt(now), schedule_id),
+                    )
+                    results.append(
+                        UpsertResult(schedule.source_key, ChangeKind.UNCHANGED, schedule_id)
+                    )
+                    continue
 
-            diff = self._compute_diff(existing, schedule)
-            if existing["status"] == ScheduleStatus.ARCHIVED.value:
-                diff["_resurrected"] = True
-            self._update_schedule(schedule_id, schedule, fingerprint, now)
-            self._link_games(schedule_id, self._resolve_game_ids(schedule))
-            self._record_revision(schedule_id, existing["content_hash"], fingerprint, diff, now)
-            results.append(UpsertResult(schedule.source_key, ChangeKind.CHANGED, schedule_id))
+                diff = self._compute_diff(existing, schedule)
+                if existing["status"] == ScheduleStatus.ARCHIVED.value:
+                    diff["_resurrected"] = True
+                self._update_schedule(schedule_id, schedule, fingerprint, now)
+                self._link_games(schedule_id, self._resolve_game_ids(schedule))
+                self._record_revision(schedule_id, existing["content_hash"], fingerprint, diff, now)
+                results.append(UpsertResult(schedule.source_key, ChangeKind.CHANGED, schedule_id))
 
-        results.extend(self._archive_missing(team, seen_keys, now))
-        self._conn.commit()
+            results.extend(self._archive_missing(team, seen_keys, now))
+            self._conn.commit()
+        except Exception:
+            # batch 途中の失敗を次回 commit に持ち越さないよう、部分書き込みを破棄する。
+            self._conn.rollback()
+            raise
         return results
 
     def _resolve_game_ids(self, schedule: SaleSchedule) -> list[int]:
@@ -178,7 +189,8 @@ class SqliteRepository(ScheduleRepository):
             ),
         )
         schedule_id = cursor.lastrowid
-        assert schedule_id is not None  # INSERT 直後は必ず採番される
+        if schedule_id is None:  # INSERT 直後は必ず採番される（防御的チェック）
+            raise RuntimeError("INSERT 後に lastrowid を取得できませんでした")
         return schedule_id
 
     def _update_schedule(
@@ -210,7 +222,9 @@ class SqliteRepository(ScheduleRepository):
         )
 
     def _link_games(self, schedule_id: int, game_ids: list[int]) -> None:
-        # 対象試合が変わり得るため一度クリアして張り直す。
+        # 対象試合が変わり得るため一度クリアして張り直す。どの発売からも参照されなくなった
+        # game 行は「試合が存在した事実」として残す方針（GC しない）。データ量は 12 球団分と
+        # 小さく、履歴・再バンドル時の参照にも使えるため意図的に保持する。
         self._conn.execute("DELETE FROM sale_schedule_game WHERE schedule_id = ?", (schedule_id,))
         self._conn.executemany(
             "INSERT INTO sale_schedule_game (schedule_id, game_id) VALUES (?, ?)",
@@ -332,6 +346,8 @@ class SqliteRepository(ScheduleRepository):
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY id"
         rows = self._conn.execute(query, params).fetchall()
+        # 各行で試合を個別クエリする N+1 だが、対象は 12 球団・高々数十件のため許容する
+        # （JOIN 一括ロードへの最適化は規模が問題化してから）。
         return [self._load_schedule(row) for row in rows]
 
     def list_notifiable(self) -> list[StoredSchedule]:

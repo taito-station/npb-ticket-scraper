@@ -58,10 +58,14 @@ class ScheduleRepository(ABC):
         通知内容に影響しないため、``UNCHANGED`` 時には再保存しない（``CHANGED`` 時にまとめて
         更新される）。
 
+        呼び出し側の責務: 取得失敗（サイト障害・パース失敗）時に空リストで呼ばないこと。
+        空リストは「今回 0 件だった」と解釈され当該 team の既存が全て ``ARCHIVED`` 化される。
+
         Args:
             team: 今回スクレイプした販売主体。``ARCHIVED`` 判定はこの team の範囲で行う。
             schedules: 取得したスケジュール。#2 時点の契約として、すべて ``selling_team == team``
-                であることを要求し、満たさない場合は ``ValueError`` を送出する。
+                であること、および ``source_key`` が batch 内で一意であることを要求し、満たさない
+                場合は ``ValueError`` を送出する。
             now: 観測時刻。テスト決定性のため注入する（呼び出し側は通常 ``datetime.now(UTC)``）。
 
         Returns:

@@ -198,3 +198,81 @@ def test_selling_team_mismatch_raises(repo: SqliteRepository) -> None:
 
     with pytest.raises(ValueError, match="selling_team"):
         repo.upsert_scraped(TeamId.HANSHIN, [mismatched], now=_now())
+
+
+def test_duplicate_source_key_in_batch_raises(repo: SqliteRepository) -> None:
+    # 同一 batch 内の source_key 重複はアダプタのバグとして弾く
+    dup = [_schedule(source_key="dup"), _schedule(source_key="dup")]
+
+    with pytest.raises(ValueError, match="source_key"):
+        repo.upsert_scraped(TeamId.HANSHIN, dup, now=_now())
+
+
+def test_game_fields_updated_via_upsert(repo: SqliteRepository) -> None:
+    # 開始時刻が未定のまま登録 → 後日 18:00 に確定したケースを取り込む
+    undecided = Game(
+        game_date=date(2026, 7, 10),
+        home_team=TeamId.HANSHIN,
+        away_team=TeamId.GIANTS,
+        venue="阪神甲子園球場",
+        season_type=SeasonType.REGULAR,
+        start_time=None,
+    )
+    repo.upsert_scraped(TeamId.HANSHIN, [_schedule(source_key="k", games=[undecided])], now=_now(1))
+
+    decided = _game(day=10)  # start_time=18:00
+    # sale 側も変えて CHANGED 経路に乗せ、試合の再解決を発火させる
+    changed = _schedule(
+        source_key="k", games=[decided], sale_start=datetime(2026, 6, 21, 10, 0, tzinfo=UTC)
+    )
+    repo.upsert_scraped(TeamId.HANSHIN, [changed], now=_now(2))
+
+    stored_game = repo.list_schedules()[0].schedule.games[0]
+    assert stored_game.start_time == time(18, 0)  # UPSERT で確定値が反映される
+    game_count = repo._conn.execute("SELECT COUNT(*) c FROM game").fetchone()
+    assert game_count["c"] == 1  # 自然キー一致なので行は増えない
+
+
+def test_mark_confirmed_ignores_archived(repo: SqliteRepository) -> None:
+    repo.upsert_scraped(TeamId.HANSHIN, [_schedule()], now=_now(1))
+    schedule_id = repo.list_schedules()[0].schedule_id
+    repo.upsert_scraped(TeamId.HANSHIN, [], now=_now(2))  # ARCHIVED 化
+    assert repo.list_schedules()[0].status == ScheduleStatus.ARCHIVED
+
+    repo.mark_confirmed(schedule_id, now=_now(3))  # ARCHIVED は昇格しない（no-op）
+
+    assert repo.list_schedules()[0].status == ScheduleStatus.ARCHIVED
+    assert repo.list_notifiable() == []
+
+
+def test_list_schedules_filters_by_team_and_status(repo: SqliteRepository) -> None:
+    hanshin = _schedule(source_key="h")
+    repo.upsert_scraped(TeamId.HANSHIN, [hanshin], now=_now(1))
+    giants_game = Game(
+        game_date=date(2026, 7, 20),
+        home_team=TeamId.GIANTS,
+        away_team=TeamId.HANSHIN,
+        venue="東京ドーム",
+        season_type=SeasonType.REGULAR,
+        start_time=time(18, 0),
+    )
+    giants = SaleSchedule(
+        selling_team=TeamId.GIANTS,
+        sale_type=SaleType.GENERAL,
+        sale_label="一般発売",
+        sale_start=datetime(2026, 6, 25, 10, 0, tzinfo=UTC),
+        sale_end=None,
+        games=[giants_game],
+        official_url="https://www.giants.jp/ticket/",
+        source_url="https://www.giants.jp/ticket/",
+        source_key="g",
+    )
+    repo.upsert_scraped(TeamId.GIANTS, [giants], now=_now(1))
+    repo.mark_confirmed(repo.list_schedules(team=TeamId.GIANTS)[0].schedule_id, now=_now(2))
+
+    assert len(repo.list_schedules()) == 2
+    assert len(repo.list_schedules(team=TeamId.HANSHIN)) == 1
+    assert repo.list_schedules(team=TeamId.HANSHIN)[0].schedule.selling_team == TeamId.HANSHIN
+    confirmed = repo.list_schedules(status=ScheduleStatus.CONFIRMED)
+    assert len(confirmed) == 1
+    assert confirmed[0].schedule.selling_team == TeamId.GIANTS

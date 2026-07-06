@@ -24,6 +24,9 @@ build/
 *.env
 !.env.example
 
+# --- 作業用一時ファイル（PR 本文の下書き等） ---
+docs/temp/
+
 # --- Claude Code（ユーザーローカル設定） ---
 .claude/settings.local.json
 
