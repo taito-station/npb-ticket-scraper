@@ -110,8 +110,9 @@ def _infer_year(month: int, published: date) -> int:
 def parse_article_list(html: str, *, base_url: str = _BASE) -> list[ArticleRef]:
     """月別アーカイブ HTML から発売系記事の参照を抽出する。
 
-    タイトルに「発売」「販売」を含む記事のみ対象にする（グッズ告知や注意喚起を除外）。
-    取得先は阪神サイトに限定し、外部ホストの絶対 URL が混入しても弾く。
+    タイトルに ``_SALE_TITLE_KEYWORDS``（発売/販売/抽選/先行/受付）のいずれかを含む記事のみ
+    対象にする（グッズ告知や注意喚起を除外）。取得先は阪神サイトに限定し、外部ホストの絶対
+    URL が混入しても弾く。
     """
     soup = BeautifulSoup(html, "html.parser")
     refs: list[ArticleRef] = []
