@@ -39,6 +39,9 @@ robots.txt を尊重し、低頻度・適切な間隔でアクセスする。
 
 ## 5. 実行基盤・データ保存
 
+> 注: 本節の自動スクレイピング実行基盤（Azure Functions Timer Trigger）と SQLite 状態管理は、§9 の転換により
+> **当面休眠**。当面は完全手動運用で、状態保持・差分検知は登録API側（Firestore）が担う。
+
 - 実行基盤: ローカル実行で検証 → 将来 Azure Functions（Timer Trigger, **Consumption プラン**で可。
   ヘッドレス不要が確定したため）。スクレイパーは API を持たないバッチ処理。
 - 状態管理: ローカルは **SQLite** ファイル（`.db` は gitignore 済み。データはコミットしない）。
@@ -138,8 +141,8 @@ Repository 抽象境界 + SQLite 実装**。ドメイン層と差分検知ロジ
 - **抽出は本リポジトリの責務から外れる**。`adapters/hanshin.py` の散文パーサはフォールバック／eval baseline
   として残すが、球団別パーサの新規増設は行わない。
 - **本リポジトリの SQLite 差分検知（§4・§7）は当面休眠**（自動再スクレイピング前提の仕組みのため）。差分検知の
-  概念は登録API側（Firestore）で新たに実装する方針で、`content_fingerprint()` から `games`（現行スキーマでは
-  持たない）を除いた `content_hash` を冪等 upsert に用いる。
+  概念は登録API側（Firestore）で新たに実装する方針で、`content_fingerprint()` から `games`（登録API側の
+  Firestore スキーマでは持たない）を除いた `content_hash` を冪等 upsert に用いる。
 - **将来の自動化**は「新着告知 URL の検知層」（一覧リンクの差分のみ。中身は解析しない＝年度変動に強い）として
   再導入しうる。手書きパーサ地獄には戻さない。
 
