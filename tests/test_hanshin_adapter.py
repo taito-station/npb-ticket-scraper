@@ -244,6 +244,47 @@ def test_article_list_skips_rows_without_date_and_external_hosts() -> None:
     assert parse_article_list(external) == []  # 外部ホストの絶対 URL は取得対象にしない
 
 
+def test_article_list_accepts_lottery_and_presale_titles() -> None:
+    # 「発売/販売」を含まない抽選・先行・受付の告知も一覧で拾う（分類器の守備範囲と整合）
+    html = (
+        "<ul>"
+        "<li>[26/01/10] <a href='/news/topics/info_20.html'>開幕戦チケット先行抽選申込受付</a></li>"
+        "<li>[26/01/11] <a href='/news/topics/info_21.html'>グッズ入荷のお知らせ</a></li>"
+        "</ul>"
+    )
+    urls = [r.url for r in parse_article_list(html)]
+    assert urls == ["https://hanshintigers.jp/news/topics/info_20.html"]
+
+
+def test_datetime_without_weekday_is_parsed() -> None:
+    # 曜日括弧の無い日時表記でも取りこぼさない
+    html = _article(
+        "<p>阪神甲子園球場で開催される公式戦の入場券を、2月25日12:00よりインターネットにて発売いたします。</p>"
+    )
+    schedules = parse_sale_article(
+        html,
+        article_url="https://hanshintigers.jp/news/topics/info_5.html",
+        published_date=date(2026, 1, 29),
+    )
+
+    assert schedules[0].sale_start == datetime(2026, 2, 25, 12, 0, tzinfo=JST)
+
+
+def test_fetch_schedules_skips_failed_pages() -> None:
+    # 1 記事の取得失敗で run 全体を止めず、取得できた分だけ返す
+    def flaky_fetch(url: str) -> str:
+        if "info_10694" in url:
+            raise RuntimeError("boom")
+        return _fake_fetch(url)
+
+    schedules = HanshinAdapter(fetch=flaky_fetch).fetch_schedules()
+
+    keys = {s.source_key for s in schedules}
+    assert keys  # 空にならない
+    assert any("10652" in k for k in keys)  # 生きている記事は取得できる
+    assert not any("10694" in k for k in keys)  # 落ちた記事は含まれない
+
+
 # --- Repository 統合 ------------------------------------------------------------
 
 
