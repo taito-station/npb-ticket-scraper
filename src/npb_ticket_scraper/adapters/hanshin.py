@@ -9,33 +9,41 @@
   個別の対戦カードは列挙されず別ページ（動的）に委譲されるため、#3 PoC では球場単位で扱い games は空にする。
 
 規約確認済み: robots.txt 不在（全許可）・利用規約に自動アクセス禁止条項なし・抽出対象は著作権保護外の
-事実（docs/decisions.md §8）。低頻度アクセスの作法を守る。
+事実（docs/decisions.md §8）。低頻度アクセスの作法を守る（実行内でも連続取得の間に小休止を挟む）。
 """
 
 from __future__ import annotations
 
+import logging
 import re
+import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from .. import fetcher
 from ..models import SaleSchedule, SaleType, TeamId
 from .base import TeamAdapter
 
+logger = logging.getLogger(__name__)
+
 JST = ZoneInfo("Asia/Tokyo")
 _BASE = "https://hanshintigers.jp"
+_HOST = urlparse(_BASE).netloc  # 抽出 URL をこのホストに限定する（外部 URL 混入を弾く）
 
 # 記事詳細ページ（info_XXXXX.html）への相対/絶対リンク。数字部分が安定した記事 ID。
 _ARTICLE_HREF_RE = re.compile(r"/news/topics/info_(\d+)\.html")
 # 記事一覧行の日付表記 [YY/MM/DD]
 _LIST_DATE_RE = re.compile(r"\[(\d{2})/(\d{2})/(\d{2})\]")
 # 発売散文中の「M月D日(曜)[HH:MM]より{チャネル}」。時刻は無い告知もあるためオプション。
+# 曜日括弧は「(水・祝)」のような併記を許容する。全角表記は事前に NFKC 正規化して半角に寄せる。
 _SALE_RE = re.compile(
-    r"(\d{1,2})月(\d{1,2})日\([月火水木金土日]\)"
+    r"(\d{1,2})月(\d{1,2})日\([月火水木金土日][^)]{0,4}\)"
     r"(?:\s*(\d{1,2}):(\d{2}))?\s*より\s*(インターネット|各店舗|店舗|電話)"
 )
 
@@ -44,6 +52,11 @@ _VENUES: tuple[tuple[str, str, str], ...] = (
     ("甲子園", "阪神甲子園球場", "koshien"),
     ("京セラ", "京セラドーム大阪", "kyocera"),
 )
+_VENUE_RE = re.compile("|".join(re.escape(keyword) for keyword, _, _ in _VENUES))
+_VENUE_BY_KEYWORD = {keyword: (name, slug) for keyword, name, slug in _VENUES}
+# 「また」を節境界として分割する。ただし「または」「またがる」「またぐ」など語中の「また」は
+# 節境界ではないので分割しない（後続が は/が/ぐ のものを除外）。
+_CLAUSE_SPLIT_RE = re.compile(r"また(?![はがぐ])")
 # 販売チャネル原文 → スラッグ
 _CHANNELS: dict[str, str] = {
     "インターネット": "net",
@@ -51,6 +64,9 @@ _CHANNELS: dict[str, str] = {
     "店舗": "store",
     "電話": "phone",
 }
+
+# 同一ホストへ連続アクセスする際に挟む小休止（秒）。礼儀としての最低限のレート制御。
+_COURTESY_DELAY = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,18 +103,11 @@ def _infer_year(month: int, published: date) -> int:
     return year
 
 
-def _venues_in(text: str) -> list[tuple[str, str]]:
-    """テキストに登場する球場（正式名, スラッグ）を出現順で返す。
-
-    1 文に「甲子園ならびに京セラ」のように複数球場が並ぶ告知があるため複数対応する。
-    """
-    return [(name, slug) for keyword, name, slug in _VENUES if keyword in text]
-
-
 def parse_article_list(html: str, *, base_url: str = _BASE) -> list[ArticleRef]:
     """月別アーカイブ HTML から発売系記事の参照を抽出する。
 
     タイトルに「発売」「販売」を含む記事のみ対象にする（グッズ告知や注意喚起を除外）。
+    取得先は阪神サイトに限定し、外部ホストの絶対 URL が混入しても弾く。
     """
     soup = BeautifulSoup(html, "html.parser")
     refs: list[ArticleRef] = []
@@ -106,6 +115,8 @@ def parse_article_list(html: str, *, base_url: str = _BASE) -> list[ArticleRef]:
     for anchor in soup.find_all("a", href=_ARTICLE_HREF_RE):
         href = anchor["href"]
         url = href if href.startswith("http") else f"{base_url}{href}"
+        if urlparse(url).netloc != _HOST:  # 外部ホストは取得しない（SSRF 面の防御）
+            continue
         if url in seen:
             continue
         title = " ".join(anchor.get_text(" ", strip=True).split())
@@ -119,18 +130,17 @@ def parse_article_list(html: str, *, base_url: str = _BASE) -> list[ArticleRef]:
     return refs
 
 
-def _extract_list_date(anchor: object) -> date | None:
+def _extract_list_date(anchor: Tag) -> date | None:
     """記事リンクの周辺行から ``[YY/MM/DD]`` を読む。"""
-    node = anchor
+    node: Tag | None = anchor
     for _ in range(4):  # li/dd/tr など日付を含む最小の親までさかのぼる
-        parent = node.find_parent() if hasattr(node, "find_parent") else None
-        if parent is None:
+        node = node.find_parent() if node is not None else None
+        if node is None:
             break
-        match = _LIST_DATE_RE.search(parent.get_text(" ", strip=True))
+        match = _LIST_DATE_RE.search(node.get_text(" ", strip=True))
         if match:
             yy, mm, dd = (int(g) for g in match.groups())
             return date(2000 + yy, mm, dd)
-        node = parent
     return None
 
 
@@ -149,13 +159,48 @@ def _article_title(soup: BeautifulSoup) -> str:
     return title_tag.get_text(strip=True).split("｜")[0].strip()
 
 
+def _assign_clause(
+    clause: str, segments: list[re.Match[str]], current: list[tuple[str, str]]
+) -> tuple[list[tuple[re.Match[str], list[tuple[str, str]]]], list[tuple[str, str]]]:
+    """1 節内の各発売セグメントに球場群を割り当て、更新後の「現在の球場群」を返す。
+
+    節内の球場キーワードとセグメントを出現位置順に走査する。セグメント直前に連続して現れた
+    球場（「甲子園ならびに京セラ」なら両方）でその節の球場群を更新し、球場が現れなければ節を
+    またいで直前の球場群（``current``）を引き継ぐ（「…発売、また2月2日より…」で日程だけ増える
+    ケースに対応）。呼び出し側が節ごとに ``current`` を渡し継ぐことで、「甲子園…また京セラ…」の
+    球場別日程も、球場が単独で登場して発売セグメントを持たない節（他球場へ誘導）も正しく扱える。
+    """
+    events: list[tuple[int, str, object]] = []
+    for m in _VENUE_RE.finditer(clause):
+        events.append((m.start(), "venue", _VENUE_BY_KEYWORD[m.group()]))
+    for seg in segments:
+        events.append((seg.start(), "seg", seg))
+    events.sort(key=lambda e: e[0])
+
+    assigned: list[tuple[re.Match[str], list[tuple[str, str]]]] = []
+    pending: list[tuple[str, str]] = []
+    for _pos, kind, payload in events:
+        if kind == "venue":
+            pending.append(payload)  # type: ignore[arg-type]
+        else:
+            if pending:  # 直前に現れた球場群で更新（無ければ前節の球場を継承）
+                current = list(dict.fromkeys(pending))
+                pending = []
+            assigned.append((payload, list(current)))  # type: ignore[arg-type]
+    if pending:  # セグメントを伴わず球場だけ登場した節は、その球場群を次節へ引き継ぐ
+        current = list(dict.fromkeys(pending))
+    return assigned, current
+
+
 def parse_sale_article(html: str, *, article_url: str, published_date: date) -> list[SaleSchedule]:
     """記事詳細 HTML から球場×チャネル単位の SaleSchedule 群を生成する。
 
-    告知の散文には 2 系統ある: ①球場ごとに別日程（「甲子園…また京セラ…」）、
-    ②複数球場に同一日程（「甲子園ならびに京セラ…」）。共通処理として、発売情報ブロックを
-    「また」で節に分割し、各節に登場する球場（無ければ前節を継承）へ、その節の全発売
-    セグメントを割り当てる。時刻の無い告知は日付のみ保持し notes に要確認と記す。
+    発売情報ブロックを「また」で節に分割し、各節を ``_assign_clause`` に渡して発売セグメント
+    （日付・時刻・チャネル）へ球場を割り当てる。時刻の無い告知は日付のみ確定し notes に要確認と記す。
+
+    注: 同一記事内で同一 (球場, チャネル) が別日程で複数回告知された場合、source_key が同一のため
+    後続は取り込まない（1 発売告知＝1 スケジュールの粒度。実データ上は稀）。球場を特定できない
+    発売文（地方球場など未登録球場）は警告ログに残す。
     """
     soup = BeautifulSoup(html, "html.parser")
     body = soup.find(id="news-entry") or soup
@@ -167,18 +212,18 @@ def parse_sale_article(html: str, *, article_url: str, published_date: date) -> 
     schedules: list[SaleSchedule] = []
     seen_keys: set[str] = set()
     for block in body.find_all(["p", "td", "li"]):
-        text = " ".join(block.get_text(" ", strip=True).split())
+        # 全角の括弧・コロン・数字を半角へ寄せてから解析する（表記ゆれ耐性）
+        text = unicodedata.normalize("NFKC", " ".join(block.get_text(" ", strip=True).split()))
         if not _SALE_RE.search(text):
             continue
+        produced = 0
         current_venues: list[tuple[str, str]] = []
-        for clause in text.split("また"):
-            venues = _venues_in(clause)
-            if venues:
-                current_venues = venues
-            if not current_venues:
-                continue
-            for mo, day, hh, mm, channel in _SALE_RE.findall(clause):
-                for venue_name, venue_slug in current_venues:
+        for clause in _CLAUSE_SPLIT_RE.split(text):
+            segments = list(_SALE_RE.finditer(clause))
+            assigned, current_venues = _assign_clause(clause, segments, current_venues)
+            for match, venues in assigned:
+                mo, day, hh, mm, channel = match.groups()
+                for venue_name, venue_slug in venues:
                     source_key = f"hanshin:{article_id}:{venue_slug}:{_CHANNELS[channel]}"
                     if source_key in seen_keys:
                         continue
@@ -205,6 +250,9 @@ def parse_sale_article(html: str, *, article_url: str, published_date: date) -> 
                             notes=notes,
                         )
                     )
+                    produced += 1
+        if produced == 0:  # 発売日時はあるが球場を特定できない（未登録球場の可能性）
+            logger.warning("球場を特定できない発売文をスキップしました: %s", text[:80])
     return schedules
 
 
@@ -227,16 +275,31 @@ class HanshinAdapter(TeamAdapter):
     team_id = TeamId.HANSHIN
     TICKET_ARCHIVE_URL = f"{_BASE}/news/topics/ticket/{{year_month}}"
 
-    def __init__(self, fetch: Callable[[str], str] = fetcher.get_text) -> None:
+    def __init__(
+        self,
+        fetch: Callable[[str], str] = fetcher.get_text,
+        *,
+        months: list[str] | None = None,
+    ) -> None:
         # fetch を差し替え可能にし、パースをネットワークから切り離してテストする。
+        # months 未指定なら当月＋直近数ヶ月（本番の日次実行向け）。過去月指定で初期投入/デモに使える。
         self._fetch = fetch
+        self._months = months
+        # 実ネットワーク取得のときだけ小休止を挟む（注入 fetch のテストは待たない）。
+        self._courtesy_delay = _COURTESY_DELAY if fetch is fetcher.get_text else 0.0
 
-    def fetch_schedules(self, *, months: list[str] | None = None) -> list[SaleSchedule]:
-        # months 未指定なら当月＋直近数ヶ月（本番の日次実行向け）。過去月を渡せば初期投入/デモに使える。
-        if months is None:
-            months = _recent_months(datetime.now(JST).date())
+    def _pause(self) -> None:
+        if self._courtesy_delay:
+            time.sleep(self._courtesy_delay)
+
+    def fetch_schedules(self) -> list[SaleSchedule]:
+        months = (
+            self._months if self._months is not None else _recent_months(datetime.now(JST).date())
+        )
         refs: dict[str, ArticleRef] = {}
-        for year_month in months:
+        for index, year_month in enumerate(months):
+            if index:
+                self._pause()
             list_html = self._fetch(self.TICKET_ARCHIVE_URL.format(year_month=year_month))
             for ref in parse_article_list(list_html):
                 refs.setdefault(ref.url, ref)  # 月をまたぐ重複を排除
@@ -244,6 +307,7 @@ class HanshinAdapter(TeamAdapter):
         schedules: list[SaleSchedule] = []
         seen_keys: set[str] = set()
         for ref in refs.values():
+            self._pause()
             article_html = self._fetch(ref.url)
             for schedule in parse_sale_article(
                 article_html, article_url=ref.url, published_date=ref.published_date

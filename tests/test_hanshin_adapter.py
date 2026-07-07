@@ -6,8 +6,11 @@ HTML は実サイトのコピーではなく、構造を模した最小の合成
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from npb_ticket_scraper.adapters.hanshin import (
     HanshinAdapter,
@@ -150,6 +153,95 @@ def test_infer_year_handles_year_wrap() -> None:
 
 def test_recent_months_counts_back_across_year_boundary() -> None:
     assert _recent_months(date(2026, 2, 15), back=3) == ["202602", "202601", "202512", "202511"]
+
+
+# --- 実データ耐性（表記ゆれ・構造ゆれ） ------------------------------------------
+
+
+def _article(body: str, *, title: str = "公式戦入場券発売") -> str:
+    return f"<html><head><title>{title}｜球団ニュース</title></head><body><div id='news-entry'>{body}</div></body></html>"
+
+
+def test_holiday_weekday_and_fullwidth_are_parsed() -> None:
+    # 祝日併記「（月・祝）」＋全角数字/括弧/コロンでも取りこぼさない
+    html = _article(
+        "<p>阪神甲子園球場で開催される公式戦の入場券を、２月２３日（月・祝）１２：００よりインターネットにて発売いたします。</p>"
+    )
+    schedules = parse_sale_article(
+        html,
+        article_url="https://hanshintigers.jp/news/topics/info_1.html",
+        published_date=date(2026, 1, 29),
+    )
+
+    assert len(schedules) == 1
+    assert schedules[0].source_key == "hanshin:1:koshien:net"
+    assert schedules[0].sale_start == datetime(2026, 2, 23, 12, 0, tzinfo=JST)
+
+
+def test_multiple_venues_without_matakiri_are_not_cross_bound() -> None:
+    # 「また」区切りが無く球場ごとに別日程でも、日時が球場をまたいで誤結合しない
+    html = _article(
+        "<p>阪神甲子園球場は2月25日(水)12:00よりインターネットにて、"
+        "京セラドーム大阪は2月19日(木)12:00よりインターネットにて発売いたします。</p>"
+    )
+    schedules = parse_sale_article(
+        html,
+        article_url="https://hanshintigers.jp/news/topics/info_1.html",
+        published_date=date(2026, 1, 29),
+    )
+
+    by_key = {s.source_key: s for s in schedules}
+    assert by_key["hanshin:1:koshien:net"].sale_start == datetime(2026, 2, 25, 12, 0, tzinfo=JST)
+    assert by_key["hanshin:1:kyocera:net"].sale_start == datetime(2026, 2, 19, 12, 0, tzinfo=JST)
+
+
+def test_unknown_venue_is_skipped_with_warning(caplog: pytest.LogCaptureFixture) -> None:
+    html = _article(
+        "<p>ほっともっとフィールド神戸で開催される公式戦の入場券を、"
+        "2月1日(日)10:00より各店舗にて発売いたします。</p>"
+    )
+    with caplog.at_level(logging.WARNING):
+        schedules = parse_sale_article(
+            html,
+            article_url="https://hanshintigers.jp/news/topics/info_2.html",
+            published_date=date(2026, 1, 20),
+        )
+
+    assert schedules == []  # 未登録球場は取り込まない
+    assert any("球場を特定できない" in r.message for r in caplog.records)
+
+
+def test_phone_channel_is_recognized() -> None:
+    html = _article(
+        "<p>阪神甲子園球場で開催される公式戦の入場券を、2月10日(火)10:00より電話にて発売いたします。</p>"
+    )
+    schedules = parse_sale_article(
+        html,
+        article_url="https://hanshintigers.jp/news/topics/info_3.html",
+        published_date=date(2026, 1, 20),
+    )
+
+    assert schedules[0].source_key == "hanshin:3:koshien:phone"
+
+
+def test_article_id_missing_raises() -> None:
+    with pytest.raises(ValueError, match="記事 ID"):
+        parse_sale_article(
+            "<p>x</p>",
+            article_url="https://example.com/no-article-id",
+            published_date=date(2026, 1, 1),
+        )
+
+
+def test_article_list_skips_rows_without_date_and_external_hosts() -> None:
+    no_date = "<ul><li><a href='/news/topics/info_9.html'>特別企画チケット発売</a></li></ul>"
+    assert parse_article_list(no_date) == []  # [YY/MM/DD] が無い行は除外
+
+    external = (
+        "<ul><li>[26/01/29] "
+        "<a href='https://evil.example/news/topics/info_1.html'>入場券発売</a></li></ul>"
+    )
+    assert parse_article_list(external) == []  # 外部ホストの絶対 URL は取得対象にしない
 
 
 # --- Repository 統合 ------------------------------------------------------------

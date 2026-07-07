@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 
 from npb_ticket_scraper.adapters.hanshin import HanshinAdapter
 from npb_ticket_scraper.models import TeamId
@@ -21,14 +22,12 @@ _DB_PATH = "hanshin_poc.db"
 
 
 def main() -> None:
-    from datetime import UTC, datetime
-
     now = datetime.now(UTC)
     months = sys.argv[1:] or None  # 例: 202601 202602
 
     target = "、".join(months) if months else "直近数ヶ月"
     print(f"阪神サイトから発売スケジュールを取得中（対象: {target}）...")
-    schedules = HanshinAdapter().fetch_schedules(months=months)
+    schedules = HanshinAdapter(months=months).fetch_schedules()
     print(f"取得件数: {len(schedules)}")
     for schedule in schedules:
         start = schedule.sale_start.isoformat() if schedule.sale_start else "-"
